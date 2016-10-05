@@ -29,7 +29,7 @@ Screenshot (will need to be updated as syntax coloring and UI polish is added):
 ![xi screenshot](/doc/img/xi-mac-screenshot.png?raw=true)
 
 ## Getting started
-You need [Xcode 7.3](https://developer.apple.com/xcode/) (only on Mac) and [Rust](https://www.rust-lang.org/) (version 1.8+ is
+You need [Xcode 7.3](https://developer.apple.com/xcode/) (only on Mac) and [Rust](https://www.rust-lang.org/) (version 1.10+ is
 recommended and supported). You should have `cargo` in your path.
 
 ```
@@ -41,9 +41,11 @@ recommended and supported). You should have `cargo` in your path.
 
 Or `open XiEditor.xcodeproj` and hit the Run button.
 
-It will look better if you have [InconsolataGo](http://levien.com/type/myfonts/inconsolata.html)
-installed, a customized version Inconsolata tuned for code editing. To choose other
-fonts, edit the `CTFontCreateWithName()` call in EditView.swift.
+It will look better if you have
+[InconsolataGo](http://levien.com/type/myfonts/inconsolata.html) installed, a
+customized version of Inconsolata tuned for code editing. You can change fonts
+per window in the Font menu or with `Cmd-T`. To choose another default font,
+edit the `CTFontCreateWithName()` call in EditView.swift.
 
 ### Building the core
 
@@ -84,7 +86,7 @@ contribute to the above goals:
 
 * ***Asynchronous operations***. The editor should never, ever block and prevent the
   user from getting their work done. For example, autosave will spawn a
-  thread with a snapshot of the current editor buffer (the peristent rope
+  thread with a snapshot of the current editor buffer (the persistent rope
   data structure is copy-on-write so this operation is nearly free), which can
   then proceed to write out to disk at its leisure, while the buffer is still
   fully editable.

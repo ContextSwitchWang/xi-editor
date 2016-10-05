@@ -16,13 +16,13 @@ import Cocoa
 
 func eventToJson(event: NSEvent) -> AnyObject {
     let flags = event.modifierFlags.rawValue >> 16;
-    return ["key", ["keycode": Int(event.keyCode),
+    return ["keycode": Int(event.keyCode),
         "chars": event.characters!,
-        "flags": flags]]
+        "flags": flags]
 }
 
 func insertedStringToJson(stringToInsert: NSString) -> AnyObject {
-    return ["insert", ["chars": stringToInsert]];
+    return ["chars": stringToInsert]
 }
 
 // compute the width if monospaced, 0 otherwise
@@ -62,13 +62,13 @@ func camelCaseToUnderscored(name: NSString) -> NSString {
     return underscored;
 }
 
-class EditView: NSView {
+class EditView: NSView, NSTextInputClient {
+    var tabName: String?
+    var coreConnection: CoreConnection?
 
     // basically a cache of lines, indexed by line number
     var lineMap: [Int: [AnyObject]] = [:]
     var height: Int = 0
-
-    var coreConnection: CoreConnection?
 
     var widthConstraint: NSLayoutConstraint?
     var heightConstraint: NSLayoutConstraint?
@@ -96,6 +96,12 @@ class EditView: NSView {
     var pendingUpdate: [String: AnyObject]? = nil
 
     var currentEvent: NSEvent?
+    
+    var cursorPos: (Int, Int)?
+    var _selectedRange: NSRange
+    var _markedRange: NSRange
+    
+    var frameRect: NSRect
 
     override init(frame frameRect: NSRect) {
         let font = CTFontCreateWithName("InconsolataGo", 14, nil)
@@ -108,15 +114,46 @@ class EditView: NSView {
         fontWidth = getFontWidth(font)
         selcolor = NSColor(colorLiteralRed: 0.7, green: 0.85, blue: 0.99, alpha: 1.0)
         updateQueue = dispatch_queue_create("com.levien.xi.update", DISPATCH_QUEUE_SERIAL)
+        _selectedRange = NSMakeRange(NSNotFound, 0)
+        _markedRange = NSMakeRange(NSNotFound, 0)
+        self.frameRect = frameRect
         super.init(frame: frameRect)
         widthConstraint = NSLayoutConstraint(item: self, attribute: .Width, relatedBy: .GreaterThanOrEqual, toItem: nil, attribute: .Width, multiplier: 1, constant: 400)
         widthConstraint!.active = true
         heightConstraint = NSLayoutConstraint(item: self, attribute: .Height, relatedBy: .GreaterThanOrEqual, toItem: nil, attribute: .Height, multiplier: 1, constant: 100)
         heightConstraint!.active = true
     }
+    
+    override func changeFont(sender: AnyObject?) {
+        let oldFont = attributes[String(kCTFontAttributeName)] as! CTFontRef
+        guard let font = sender?.convertFont(oldFont) else { return }
+        ascent = CTFontGetAscent(font)
+        descent = CTFontGetDescent(font)
+        leading = CTFontGetLeading(font)
+        linespace = ceil(ascent + descent + leading)
+        baseline = ceil(ascent)
+        attributes[String(kCTFontAttributeName)] = font
+        fontWidth = getFontWidth(font)
+        needsDisplay = true
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(frameRect, cursor: NSCursor.IBeamCursor())
+    }
 
     required init?(coder: NSCoder) {
         fatalError("View doesn't support NSCoding")
+    }
+
+    func sendRpcAsync(method: String, params: AnyObject) {
+        let inner = ["method": method, "params": params, "tab": tabName!] as [String : AnyObject]
+        coreConnection?.sendRpcAsync("edit", params: inner)
+    }
+
+    func sendRpc(method: String, params: AnyObject) -> AnyObject? {
+        let inner = ["method": method, "params": params, "tab": tabName!] as [String : AnyObject]
+        return coreConnection?.sendRpc("edit", params: inner)
     }
 
     func utf8_offset_to_utf16(s: String, _ ix: Int) -> Int {
@@ -129,6 +166,10 @@ class EditView: NSView {
     }
 
     let x0: CGFloat = 2;
+
+    let font_style_bold: Int = 1;
+    let font_style_underline: Int = 2;
+    let font_style_italic: Int = 4;
 
     override func drawRect(dirtyRect: NSRect) {
         super.drawRect(dirtyRect)
@@ -162,6 +203,7 @@ class EditView: NSView {
                 let type = attr[0] as! String
                 if type == "cursor" {
                     cursor = attr[1] as? Int
+                    self.cursorPos = (lineIx, utf8_offset_to_utf16(s, cursor!))
                 } else if type == "sel" {
                     let start = attr[1] as! Int
                     let u16_start = utf8_offset_to_utf16(s, start)
@@ -174,10 +216,57 @@ class EditView: NSView {
                     let end = attr[2] as! Int
                     let u16_end = utf8_offset_to_utf16(s, end)
                     let fgcolor = colorFromArgb(UInt32(attr[3] as! Int))
+                    let font_style = attr[4] as! Int
                     //let fgcolor = colorFromArgb(0xff800000)
                     attrString.addAttribute(NSForegroundColorAttributeName, value: fgcolor, range: NSMakeRange(u16_start, u16_end - u16_start))
+                    if (font_style & font_style_underline) != 0 {
+                        attrString.addAttribute(NSUnderlineStyleAttributeName,
+                                                value: NSUnderlineStyle.StyleSingle.rawValue,
+                                                range: NSMakeRange(u16_start, u16_end - u16_start))
+                    }
+                    let fake_italic = true  // TODO: figure this out based on font support
+                    if fake_italic  && (font_style & font_style_italic) != 0 {
+                        attrString.addAttribute(NSObliquenessAttributeName,
+                                                value: 0.2,
+                                                range: NSMakeRange(u16_start, u16_end - u16_start))
+                    }
+                    let trait_mask = font_style_bold | (fake_italic ? 0 : font_style_italic)
+                    if (font_style & trait_mask) != 0 {
+                        var traits: NSFontTraitMask
+                        switch font_style & trait_mask {
+                        case font_style_bold:
+                            traits = NSFontTraitMask.BoldFontMask
+                        case font_style_italic:
+                            traits = NSFontTraitMask.ItalicFontMask
+                        case (font_style_bold | font_style_italic):
+                            traits = [NSFontTraitMask.BoldFontMask, NSFontTraitMask.ItalicFontMask]
+                        default:
+                            traits = []
+                        }
+                        attrString.applyFontTraits(traits, range: NSMakeRange(u16_start, u16_end - u16_start))
+                    }
                 }
             }
+            if let c = cursor {
+                let cix = utf8_offset_to_utf16(s, c)
+                if (markedRange().location != NSNotFound) {
+                    let markRangeStart = cix - markedRange().length
+                    if (markRangeStart >= 0) {
+                        attrString.addAttribute(NSUnderlineStyleAttributeName,
+                                                value: NSUnderlineStyle.StyleSingle.rawValue,
+                                                range: NSMakeRange(markRangeStart, markedRange().length))
+                    }
+                }
+                if (selectedRange().location != NSNotFound) {
+                    let selectedRangeStart = cix - markedRange().length + selectedRange().location
+                    if (selectedRangeStart >= 0) {
+                        attrString.addAttribute(NSUnderlineStyleAttributeName,
+                                                value: NSUnderlineStyle.StyleThick.rawValue,
+                                                range: NSMakeRange(selectedRangeStart, selectedRange().length))
+                    }
+                }
+            }
+            
             // TODO: I don't understand where the 13 comes from (it's what aligns with baseline. We
             // probably want to move to using CTLineDraw instead of drawing the attributed string,
             // but that means drawing the selection highlight ourselves (which has other benefits).
@@ -223,35 +312,188 @@ class EditView: NSView {
         // store current event so that it can be sent to the core
         // if the selector for the event is "noop:".
         currentEvent = theEvent;
-        self.interpretKeyEvents([theEvent]);
+        self.inputContext?.handleEvent(theEvent);
         currentEvent = nil;
     }
 
+    // NSResponder (used mostly for paste)
     override func insertText(insertString: AnyObject) {
-        if let coreConnection = coreConnection {
-            coreConnection.sendJson(insertedStringToJson(insertString as! NSString))
-        }
+        sendRpcAsync("insert", params: insertedStringToJson(insertString as! NSString))
     }
 
-    override func doCommandBySelector(aSelector: Selector) {
-        if (self.respondsToSelector(aSelector)) {
-            super.doCommandBySelector(aSelector);
-        } else if let coreConnection = coreConnection {
-            let commandName = camelCaseToUnderscored(aSelector.description).stringByReplacingOccurrencesOfString(":", withString: "");
-            if (commandName == "noop") {
-                coreConnection.sendJson(eventToJson(currentEvent!));
-            } else {
-                coreConnection.sendJson([commandName, []]);
+    // NSTextInputClient protocol
+    func insertText(aString: AnyObject, replacementRange: NSRange) {
+        self.removeMarkedText()
+        self.replaceCharactersInRange(replacementRange, withText: aString)
+    }
+    
+    func replacementMarkedRange(replacementRange: NSRange) -> NSRange {
+        var markedRange = _markedRange
+        
+        
+        if (markedRange.location == NSNotFound) {
+            markedRange = _selectedRange
+        }
+        if (replacementRange.location != NSNotFound) {
+            var newRange: NSRange = markedRange
+            newRange.location += replacementRange.location
+            newRange.length += replacementRange.length
+            if (NSMaxRange(newRange) <= NSMaxRange(markedRange)) {
+                markedRange = newRange
             }
+        }
+        
+        return markedRange
+    }
+    
+    func replaceCharactersInRange(aRange: NSRange, withText aString: AnyObject) -> NSRange {
+        var replacementRange = aRange
+        var len = 0
+        if let attrStr = aString as? NSAttributedString {
+            len = attrStr.string.characters.count
+        } else if let str = aString as? NSString {
+            len = str.length
+        }
+        if (replacementRange.location == NSNotFound) {
+            replacementRange.location = 0
+            replacementRange.length = 0
+        }
+        for _ in 0..<aRange.length {
+            sendRpcAsync("delete_backward", params  : [])
+        }
+        if let attrStr = aString as? NSAttributedString {
+            sendRpcAsync("insert", params: insertedStringToJson(attrStr.string))
+        } else if let str = aString as? NSString {
+            sendRpcAsync("insert", params: insertedStringToJson(str))
+        }
+        return NSMakeRange(replacementRange.location, len)
+    }
+    
+    func setMarkedText(aString: AnyObject, selectedRange: NSRange, replacementRange: NSRange) {
+        var mutSelectedRange = selectedRange
+        let effectiveRange = self.replaceCharactersInRange(self.replacementMarkedRange(replacementRange), withText: aString)
+        if (selectedRange.location != NSNotFound) {
+            mutSelectedRange.location += effectiveRange.location
+        }
+        _selectedRange = mutSelectedRange
+        _markedRange = effectiveRange
+        if (effectiveRange.length == 0) {
+            self.removeMarkedText()
         }
     }
     
+    func removeMarkedText() {
+        if (_markedRange.location != NSNotFound) {
+            for _ in 0..<_markedRange.length {
+                sendRpcAsync("delete_backward", params: [])
+            }
+        }
+        _markedRange = NSMakeRange(NSNotFound, 0)
+        _selectedRange = NSMakeRange(NSNotFound, 0)
+    }
+    
+    func unmarkText() {
+        self._markedRange = NSMakeRange(NSNotFound, 0)
+    }
+    
+    func selectedRange() -> NSRange {
+        return _selectedRange
+    }
+    
+    func markedRange() -> NSRange {
+        return _markedRange
+    }
+    
+    func hasMarkedText() -> Bool {
+        return _markedRange.location != NSNotFound
+    }
+    
+    func attributedSubstringForProposedRange(aRange: NSRange, actualRange: NSRangePointer) -> NSAttributedString? {
+        return NSAttributedString()
+    }
+    
+    func validAttributesForMarkedText() -> [String] {
+        return [NSForegroundColorAttributeName, NSBackgroundColorAttributeName]
+    }
+    
+    func firstRectForCharacterRange(aRange: NSRange, actualRange: NSRangePointer) -> NSRect {
+        if let viewWinFrame = self.window?.convertRectToScreen(self.frame),
+            let (lineIx, pos) = self.cursorPos,
+            let line = getLine(lineIx) {
+            let str = line[0] as! String
+            let ctLine = CTLineCreateWithAttributedString(NSMutableAttributedString(string: str, attributes: self.attributes))
+            let rangeWidth = CTLineGetOffsetForStringIndex(ctLine, pos, nil) - CTLineGetOffsetForStringIndex(ctLine, pos - aRange.length, nil)
+            return NSRect(x: viewWinFrame.origin.x + CTLineGetOffsetForStringIndex(ctLine, pos, nil),
+                          y: viewWinFrame.origin.y + viewWinFrame.size.height - linespace * CGFloat(lineIx + 1) - 5,
+                          width: rangeWidth,
+                          height: linespace)
+        } else {
+            return NSRect(x: 0, y: 0, width: 0, height: 0)
+        }
+    }
+    
+    func characterIndexForPoint(aPoint: NSPoint) -> Int {
+        return 0
+    }
+    
+    override func doCommandBySelector(aSelector: Selector) {
+        if (self.respondsToSelector(aSelector)) {
+            super.doCommandBySelector(aSelector);
+        } else {
+            let commandName = camelCaseToUnderscored(aSelector.description).stringByReplacingOccurrencesOfString(":", withString: "");
+            if (commandName == "noop") {
+                sendRpcAsync("key", params: eventToJson(currentEvent!));
+            } else {
+                sendRpcAsync(commandName, params: []);
+            }
+        }
+    }
+
+    func cutCopy(method: String) {
+        let text = sendRpc(method, params: [])
+        if let text = text as? String {
+            let pasteboard = NSPasteboard.generalPasteboard()
+            pasteboard.clearContents()
+            pasteboard.writeObjects([text])
+        }
+    }
+
+    func cut(sender: AnyObject?) {
+        cutCopy("cut")
+    }
+
+    func copy(sender: AnyObject?) {
+        cutCopy("copy")
+    }
+
+    func paste(sender: AnyObject?) {
+        let pasteboard = NSPasteboard.generalPasteboard()
+        if let items = pasteboard.pasteboardItems {
+            for element in items {
+                if let str = element.stringForType("public.utf8-plain-text") {
+                    insertText(str)
+                    break
+                }
+            }
+        }
+    }
+
+    func undo(sender: AnyObject?) {
+        sendRpcAsync("undo", params: [])
+    }
+
+    func redo(sender: AnyObject?) {
+        sendRpcAsync("redo", params: [])
+    }
+
     override func mouseDown(theEvent: NSEvent) {
+        removeMarkedText()
+        self.inputContext?.discardMarkedText()
         let (line, col) = pointToLineCol(convertPoint(theEvent.locationInWindow, fromView: nil))
         lastDragLineCol = (line, col)
         let flags = theEvent.modifierFlags.rawValue >> 16
         let clickCount = theEvent.clickCount
-        coreConnection?.sendJson(["click", [line, col, flags, clickCount]])
+        sendRpcAsync("click", params: [line, col, flags, clickCount])
         timer = NSTimer.scheduledTimerWithTimeInterval(NSTimeInterval(1.0/60), target: self, selector: #selector(autoscrollTimer), userInfo: nil, repeats: true)
         timerEvent = theEvent
     }
@@ -262,7 +504,7 @@ class EditView: NSView {
         if let last = lastDragLineCol where last != (line, col) {
             lastDragLineCol = (line, col)
             let flags = theEvent.modifierFlags.rawValue >> 16
-            coreConnection?.sendJson(["drag", [line, col, flags]])
+            sendRpcAsync("drag", params: [line, col, flags])
         }
         timerEvent = theEvent
     }
@@ -354,7 +596,7 @@ class EditView: NSView {
         if first != firstLine || last != lastLine {
             firstLine = first
             lastLine = last
-            coreConnection?.sendJson(["scroll", [firstLine, lastLine]])
+            sendRpcAsync("scroll", params: [firstLine, lastLine])
         }
     }
 
@@ -397,7 +639,7 @@ class EditView: NSView {
     
     func fetchLineRange(first: Int, _ last: Int) -> [[AnyObject]]? {
         let start = NSDate()
-        if let result = coreConnection?.sendRpc(["render_lines", ["first_line": first, "last_line": last]]) as? [[AnyObject]] {
+        if let result = sendRpc("render_lines", params: ["first_line": first, "last_line": last]) as? [[AnyObject]] {
             let interval = NSDate().timeIntervalSinceDate(start)
             Swift.print(String(format: "RPC latency = %3.2fms", interval as Double * 1e3))
             return result
@@ -405,5 +647,29 @@ class EditView: NSView {
             Swift.print("rpc error")
             return nil
         }
+    }
+    
+    var isEmpty: Bool {
+        if height == 0 { return true }
+        if height > 1 { return false }
+        if let line = getLine(0) {
+            return line[0] as? String == ""
+        } else {
+            return true
+        }
+    }
+
+    // MARK: - Debug Methods
+
+    @IBAction func debugRewrap(sender: AnyObject) {
+        sendRpcAsync("debug_rewrap", params: [])
+    }
+
+    @IBAction func debugTestFGSpans(sender: AnyObject) {
+        sendRpcAsync("debug_test_fg_spans", params: [])
+    }
+
+    @IBAction func debugRunPlugin(sender: AnyObject) {
+        sendRpcAsync("debug_run_plugin", params: [])
     }
 }
